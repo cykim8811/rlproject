@@ -54,7 +54,7 @@ def parse_args():
         help="the number of steps to run in each environment per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
-    parser.add_argument("--gae", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+    parser.add_argument("--gae", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=False,
         help="Use GAE for advantage computation")
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
@@ -85,9 +85,12 @@ def parse_args():
     return args
 
 
-def make_env(gym_id, seed, idx, capture_video, run_name):
+def make_env(gym_id, seed, idx, capture_video, run_name, render=False):
     def thunk():
-        env = gym.make(gym_id)
+        if render:
+            env = gym.make(gym_id, render_mode="human")
+        else:
+            env = gym.make(gym_id)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if capture_video:
             if idx == 0:
@@ -179,8 +182,11 @@ if __name__ == "__main__":
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    agent = Agent(envs).to(device)
-    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    render_env = make_env(args.gym_id, 0, 0, args.capture_video, run_name, render=True)()
+
+    target_policy = Agent(envs).to(device)
+    behavior_policy = Agent(envs).to(device)
+    optimizer = optim.Adam(list(target_policy.parameters()) + list(behavior_policy.parameters()), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -211,7 +217,7 @@ if __name__ == "__main__":
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
+                action, logprob, _, value = behavior_policy.get_action_and_value(next_obs)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
@@ -230,31 +236,24 @@ if __name__ == "__main__":
 
         # bootstrap value if not done
         with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
-            if args.gae:
-                advantages = torch.zeros_like(rewards).to(device)
-                lastgaelam = 0
-                for t in reversed(range(args.num_steps)):
-                    if t == args.num_steps - 1:
-                        nextnonterminal = 1.0 - next_done
-                        nextvalues = next_value
-                    else:
-                        nextnonterminal = 1.0 - dones[t + 1]
-                        nextvalues = values[t + 1]
-                    delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
-                    advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-                returns = advantages + values
-            else:
-                returns = torch.zeros_like(rewards).to(device)
-                for t in reversed(range(args.num_steps)):
-                    if t == args.num_steps - 1:
-                        nextnonterminal = 1.0 - next_done
-                        next_return = next_value
-                    else:
-                        nextnonterminal = 1.0 - dones[t + 1]
-                        next_return = returns[t + 1]
-                    returns[t] = rewards[t] + args.gamma * nextnonterminal * next_return
-                advantages = returns - values
+            next_value = behavior_policy.get_value(next_obs).reshape(1, -1)
+            target_next_value = target_policy.get_value(next_obs).reshape(1, -1)
+            
+            returns = torch.zeros_like(rewards).to(device)
+            target_returns = torch.zeros_like(rewards).to(device)
+            for t in reversed(range(args.num_steps)):
+                if t == args.num_steps - 1:
+                    nextnonterminal = 1.0 - next_done
+                    next_return = next_value
+                    target_next_return = target_next_value
+                else:
+                    nextnonterminal = 1.0 - dones[t + 1]
+                    next_return = returns[t + 1]
+                    target_next_return = target_returns[t + 1]
+                returns[t] = rewards[t] + args.gamma * nextnonterminal * next_return
+                target_returns[t] = rewards[t] + args.gamma * nextnonterminal * target_next_return
+            advantages = returns - values
+            target_advantages = target_returns - target_policy.get_value(obs.reshape((-1,) + envs.single_observation_space.shape)).reshape(-1, args.num_envs)
 
         # flatten the batch
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
@@ -264,18 +263,35 @@ if __name__ == "__main__":
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
 
+        # calculate b_target_logprobs
+        with torch.no_grad():
+            _, b_target_logprobs, _, _ = target_policy.get_action_and_value(b_obs, b_actions.long())
+        # Importance sampling weights
+        importance_sampling_weights = torch.exp(b_logprobs - b_target_logprobs).reshape(-1).detach()
+
+        b_target_advantages = target_advantages.reshape(-1).detach() * importance_sampling_weights
+        b_target_values = target_policy.get_value(b_obs).reshape(-1).detach()
+        # Calculate b_target_returns from b_target_advantages
+        b_target_returns = b_target_advantages + b_target_values
+
         # Optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
         clipfracs = []
+        target_clipfracs = []
         for epoch in range(args.update_epochs):
             np.random.shuffle(b_inds)
             for start in range(0, args.batch_size, args.minibatch_size):
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+                _, newlogprob, entropy, newvalue = behavior_policy.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+                _, target_newlogprob, target_entropy, target_newvalue = target_policy.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
+
+                target_logratio = target_newlogprob - b_target_logprobs[mb_inds]
+                target_ratio = target_logratio.exp()
 
                 with torch.no_grad():
                     # calculate approx_kl http://joschu.net/blog/kl-approx.html
@@ -283,14 +299,26 @@ if __name__ == "__main__":
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
+                    target_old_approx_kl = (-target_logratio).mean()
+                    target_approx_kl = ((target_ratio - 1) - target_logratio).mean()
+                    target_clipfracs += [((target_ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
+
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+
+                target_mb_advantages = b_target_advantages[mb_inds]
+                if args.norm_adv:
+                    target_mb_advantages = (target_mb_advantages - target_mb_advantages.mean()) / (target_mb_advantages.std() + 1e-8)
 
                 # Policy loss
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                target_pg_loss1 = -target_mb_advantages * target_ratio
+                target_pg_loss2 = -target_mb_advantages * torch.clamp(target_ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                target_pg_loss = torch.max(target_pg_loss1, target_pg_loss2).mean()
 
                 # Value loss
                 newvalue = newvalue.view(-1)
@@ -307,17 +335,36 @@ if __name__ == "__main__":
                 else:
                     v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
-                entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                target_newvalue = target_newvalue.view(-1)
+                if args.clip_vloss:
+                    target_v_loss_unclipped = (target_newvalue - b_target_returns[mb_inds]) ** 2
+                    target_v_clipped = b_values[mb_inds] + torch.clamp(
+                        target_newvalue - b_values[mb_inds],
+                        -args.clip_coef,
+                        args.clip_coef,
+                    )
+                    target_v_loss_clipped = (target_v_clipped - b_target_returns[mb_inds]) ** 2
+                    target_v_loss_max = torch.max(target_v_loss_unclipped, target_v_loss_clipped)
+                    target_v_loss = 0.5 * target_v_loss_max.mean()
+                else:
+                    target_v_loss = 0.5 * ((target_newvalue - b_target_returns[mb_inds]) ** 2).mean()
+
+                entropy_loss = entropy.mean() + target_entropy.mean()
+                loss = (pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef) + \
+                        (target_pg_loss - args.ent_coef * target_entropy.mean() + target_v_loss * args.vf_coef)
+
 
                 optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                nn.utils.clip_grad_norm_(behavior_policy.parameters(), args.max_grad_norm)
+                nn.utils.clip_grad_norm_(target_policy.parameters(), args.max_grad_norm)
                 optimizer.step()
 
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
                     break
+            
+
 
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
@@ -334,6 +381,26 @@ if __name__ == "__main__":
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+        # Render
+        render_obs = render_env.reset()
+        while True:
+            # Calculate Action with target policy
+            render_action, _, _, _ = target_policy.get_action_and_value(torch.Tensor(render_obs).to(device).unsqueeze(0))
+            next_render_obs, _, done, _ = render_env.step(render_action.cpu().item())
+            render_env.render()
+            render_obs = next_render_obs
+            if done:
+                break
+        render_obs = render_env.reset()
+        while True:
+            # Calculate Action with behavior policy
+            render_action, _, _, _ = behavior_policy.get_action_and_value(torch.Tensor(render_obs).to(device).unsqueeze(0))
+            next_render_obs, _, done, _ = render_env.step(render_action.cpu().item())
+            render_env.render()
+            render_obs = next_render_obs
+            if done:
+                break
 
     envs.close()
     writer.close()
