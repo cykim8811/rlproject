@@ -26,7 +26,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exp-name", type=str, default=os.path.basename(__file__).rstrip(".py"),
         help="the name of this experiment")
-    parser.add_argument("--gym-id", type=str, default="BreakoutNoFrameskip-v4",
+    parser.add_argument("--gym-id", type=str, default="AlienNoFrameskip-v4",
         help="the id of the gym environment")
     parser.add_argument("--learning-rate", type=float, default=2.5e-4,
         help="the learning rate of the optimizer")
@@ -134,6 +134,7 @@ class Agent(nn.Module):
         )
         self.actor = layer_init(nn.Linear(512, envs.single_action_space.n), std=0.01)
         self.critic = layer_init(nn.Linear(512, 1), std=1)
+        self.critic_variance = layer_init(nn.Linear(512, 1), std=1)
 
     def get_value(self, x):
         return self.critic(self.network(x / 255.0))
@@ -145,6 +146,9 @@ class Agent(nn.Module):
         if action is None:
             action = probs.sample()
         return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
+
+    def get_value_variance(self, x):
+        return self.critic_variance(self.network(x / 255.0))
 
 
 if __name__ == "__main__":
@@ -182,7 +186,7 @@ if __name__ == "__main__":
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    render_env = make_env(args.gym_id, 0, 0, args.capture_video, run_name, render=True)()
+    render_env = make_env(args.gym_id, 0, 0, args.capture_video, run_name, render=False)()
 
     target_policy = Agent(envs).to(device)
     behavior_policy = Agent(envs).to(device)
@@ -241,6 +245,8 @@ if __name__ == "__main__":
             
             returns = torch.zeros_like(rewards).to(device)
             target_returns = torch.zeros_like(rewards).to(device)
+            # variance_reward = target policy's value variance of obs
+            variance_reward = target_policy.get_value_variance(obs.reshape((-1,) + envs.single_observation_space.shape)).reshape(-1, args.num_envs)
             for t in reversed(range(args.num_steps)):
                 if t == args.num_steps - 1:
                     nextnonterminal = 1.0 - next_done
@@ -250,10 +256,11 @@ if __name__ == "__main__":
                     nextnonterminal = 1.0 - dones[t + 1]
                     next_return = returns[t + 1]
                     target_next_return = target_returns[t + 1]
-                returns[t] = rewards[t] + args.gamma * nextnonterminal * next_return
+                returns[t] = variance_reward[t] + args.gamma * nextnonterminal * next_return
                 target_returns[t] = rewards[t] + args.gamma * nextnonterminal * target_next_return
             advantages = returns - values
-            target_advantages = target_returns - target_policy.get_value(obs.reshape((-1,) + envs.single_observation_space.shape)).reshape(-1, args.num_envs)
+            target_values = target_policy.get_value(obs.reshape((-1,) + envs.single_observation_space.shape)).reshape(-1, args.num_envs)
+            target_advantages = target_returns - target_values
 
         # flatten the batch
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
@@ -262,14 +269,17 @@ if __name__ == "__main__":
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
+        b_target_values = target_values.reshape(-1)
 
         # calculate b_target_logprobs
         with torch.no_grad():
             _, b_target_logprobs, _, _ = target_policy.get_action_and_value(b_obs, b_actions.long())
         # Importance sampling weights
-        importance_sampling_weights = torch.exp(b_logprobs - b_target_logprobs).reshape(-1).detach()
+        importance_sampling_weights = torch.exp(b_target_logprobs - b_logprobs).reshape(-1).detach()
 
-        b_target_advantages = target_advantages.reshape(-1).detach() * importance_sampling_weights
+        b_target_value_error = target_advantages.reshape(-1).detach() ** 2
+
+        b_target_advantages = target_advantages.reshape(-1).detach()
         b_target_values = target_policy.get_value(b_obs).reshape(-1).detach()
         # Calculate b_target_returns from b_target_advantages
         b_target_returns = b_target_advantages + b_target_values
@@ -286,6 +296,8 @@ if __name__ == "__main__":
 
                 _, newlogprob, entropy, newvalue = behavior_policy.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
                 _, target_newlogprob, target_entropy, target_newvalue = target_policy.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+
+                target_value_variance = target_policy.get_value_variance(b_obs[mb_inds]).reshape(-1).detach()
 
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
@@ -320,6 +332,9 @@ if __name__ == "__main__":
                 target_pg_loss2 = -target_mb_advantages * torch.clamp(target_ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 target_pg_loss = torch.max(target_pg_loss1, target_pg_loss2).mean()
 
+
+                target_variance_loss = 0.5 * (target_value_variance - b_target_value_error[mb_inds]).pow(2).mean()
+
                 # Value loss
                 newvalue = newvalue.view(-1)
                 if args.clip_vloss:
@@ -336,22 +351,21 @@ if __name__ == "__main__":
                     v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
                 target_newvalue = target_newvalue.view(-1)
-                if args.clip_vloss:
-                    target_v_loss_unclipped = (target_newvalue - b_target_returns[mb_inds]) ** 2
-                    target_v_clipped = b_values[mb_inds] + torch.clamp(
-                        target_newvalue - b_values[mb_inds],
-                        -args.clip_coef,
-                        args.clip_coef,
-                    )
-                    target_v_loss_clipped = (target_v_clipped - b_target_returns[mb_inds]) ** 2
-                    target_v_loss_max = torch.max(target_v_loss_unclipped, target_v_loss_clipped)
-                    target_v_loss = 0.5 * target_v_loss_max.mean()
-                else:
-                    target_v_loss = 0.5 * ((target_newvalue - b_target_returns[mb_inds]) ** 2).mean()
+                target_v_loss_unclipped = (target_newvalue - b_target_returns[mb_inds]) ** 2
+                # target_v_loss_unclipped *= importance_sampling_weights[mb_inds]
+                target_v_clipped = b_values[mb_inds] + torch.clamp(
+                    target_newvalue - b_values[mb_inds],
+                    -args.clip_coef,
+                    args.clip_coef,
+                )
+                target_v_loss_clipped = (target_v_clipped - b_target_returns[mb_inds]) ** 2
+                target_v_loss_max = torch.max(target_v_loss_unclipped, target_v_loss_clipped)
+                target_v_loss = 0.5 * target_v_loss_max.mean()
 
                 entropy_loss = entropy.mean() + target_entropy.mean()
                 loss = (pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef) + \
-                        (target_pg_loss - args.ent_coef * target_entropy.mean() + target_v_loss * args.vf_coef)
+                        (target_pg_loss - args.ent_coef * target_entropy.mean() + target_v_loss * args.vf_coef) + \
+                        target_variance_loss
 
 
                 optimizer.zero_grad()
@@ -382,25 +396,49 @@ if __name__ == "__main__":
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
-        # Render
+
         render_obs = render_env.reset()
+        render_score = []
+        current_render_score = 0
         while True:
             # Calculate Action with target policy
             render_action, _, _, _ = target_policy.get_action_and_value(torch.Tensor(render_obs).to(device).unsqueeze(0))
-            next_render_obs, _, done, _ = render_env.step(render_action.cpu().item())
-            render_env.render()
+            next_render_obs, render_reward, done, _ = render_env.step(render_action.cpu().item())
+            current_render_score += render_reward
+            # render_env.render()
             render_obs = next_render_obs
             if done:
-                break
-        render_obs = render_env.reset()
-        while True:
-            # Calculate Action with behavior policy
-            render_action, _, _, _ = behavior_policy.get_action_and_value(torch.Tensor(render_obs).to(device).unsqueeze(0))
-            next_render_obs, _, done, _ = render_env.step(render_action.cpu().item())
-            render_env.render()
-            render_obs = next_render_obs
-            if done:
-                break
+                render_obs = render_env.reset()
+                render_score.append(current_render_score)
+                current_render_score = 0
+                if len(render_score) == 20:
+                    break
+            
+        writer.add_scalar("charts/render_score", np.mean(render_score), global_step)
+
+        print(f"Render Score: {np.mean(render_score)}")
+
+
+        # if epoch % 3 == 0:
+        #     # Render
+        #     render_obs = render_env.reset()
+        #     while True:
+        #         # Calculate Action with target policy
+        #         render_action, _, _, _ = target_policy.get_action_and_value(torch.Tensor(render_obs).to(device).unsqueeze(0))
+        #         next_render_obs, _, done, _ = render_env.step(render_action.cpu().item())
+        #         render_env.render()
+        #         render_obs = next_render_obs
+        #         if done:
+        #             break
+        #     render_obs = render_env.reset()
+        #     while True:
+        #         # Calculate Action with behavior policy
+        #         render_action, _, _, _ = behavior_policy.get_action_and_value(torch.Tensor(render_obs).to(device).unsqueeze(0))
+        #         next_render_obs, _, done, _ = render_env.step(render_action.cpu().item())
+        #         render_env.render()
+        #         render_obs = next_render_obs
+        #         if done:
+        #             break
 
     envs.close()
     writer.close()

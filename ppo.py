@@ -101,6 +101,16 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class Agent(nn.Module):
     def __init__(self, envs):
         super(Agent, self).__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv2d(4, 32, 8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 32, 3, stride=1),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+
         self.critic = nn.Sequential(
             layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
             nn.Tanh(),
@@ -117,9 +127,13 @@ class Agent(nn.Module):
         )
 
     def get_value(self, x):
+        x = x.swapaxes(-1, -3).swapaxes(-2, -1)
+        x = self.cnn(x)
         return self.critic(x)
 
     def get_action_and_value(self, x, action=None):
+        x = x.swapaxes(-1, -3).swapaxes(-2, -1)
+        x = self.cnn(x)
         logits = self.actor(x)
         probs = Categorical(logits=logits)
         if action is None:
