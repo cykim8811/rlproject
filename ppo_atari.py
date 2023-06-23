@@ -30,7 +30,7 @@ def parse_args():
         help="the id of the gym environment")
     parser.add_argument("--learning-rate", type=float, default=2.5e-4,
         help="the learning rate of the optimizer")
-    parser.add_argument("--seed", type=int, default=1,
+    parser.add_argument("--seed", type=int, default=2,
         help="seed of the experiment")
     parser.add_argument("--total-timesteps", type=int, default=10000000,
         help="total timesteps of the experiments")
@@ -256,7 +256,7 @@ if __name__ == "__main__":
                     nextnonterminal = 1.0 - dones[t + 1]
                     next_return = returns[t + 1]
                     target_next_return = target_returns[t + 1]
-                returns[t] = variance_reward[t] + args.gamma * nextnonterminal * next_return
+                returns[t] = rewards[t] + variance_reward[t].sqrt() # + args.gamma * nextnonterminal * next_return
                 target_returns[t] = rewards[t] + args.gamma * nextnonterminal * target_next_return
             advantages = returns - values
             target_values = target_policy.get_value(obs.reshape((-1,) + envs.single_observation_space.shape)).reshape(-1, args.num_envs)
@@ -386,9 +386,9 @@ if __name__ == "__main__":
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
-        writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
+        writer.add_scalar("losses/value_loss", target_v_loss.mean().item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
-        writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
+        writer.add_scalar("losses/entropy", target_entropy.mean().item(), global_step)
         writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
@@ -402,7 +402,7 @@ if __name__ == "__main__":
         current_render_score = 0
         while True:
             # Calculate Action with target policy
-            render_action, _, _, _ = target_policy.get_action_and_value(torch.Tensor(render_obs).to(device).unsqueeze(0))
+            render_action, _, _, _ = behavior_policy.get_action_and_value(torch.Tensor(np.array(render_obs)).to(device).unsqueeze(0))
             next_render_obs, render_reward, done, _ = render_env.step(render_action.cpu().item())
             current_render_score += render_reward
             # render_env.render()
