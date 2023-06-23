@@ -1,3 +1,8 @@
+"""
+The original code is from https://github.com/vwxyzjn/ppo-implementation-details
+Changed parts are commented.
+"""
+
 import argparse
 import os
 import random
@@ -188,6 +193,9 @@ if __name__ == "__main__":
 
     render_env = make_env(args.gym_id, 0, 0, args.capture_video, run_name, render=False)()
 
+    # ========== CHANGE ==========
+    # The Predicted UCB Methodology uses two models: target agent, behavioral agent.
+    # ============================
     target_policy = Agent(envs).to(device)
     behavior_policy = Agent(envs).to(device)
     optimizer = optim.Adam(list(target_policy.parameters()) + list(behavior_policy.parameters()), lr=args.learning_rate, eps=1e-5)
@@ -240,6 +248,9 @@ if __name__ == "__main__":
 
         # bootstrap value if not done
         with torch.no_grad():
+            # ========== CHANGE ==========
+            # The Predicted UCB Methodology uses two models: target agent, behavioral agent.
+            # ============================
             next_value = behavior_policy.get_value(next_obs).reshape(1, -1)
             target_next_value = target_policy.get_value(next_obs).reshape(1, -1)
             
@@ -256,6 +267,11 @@ if __name__ == "__main__":
                     nextnonterminal = 1.0 - dones[t + 1]
                     next_return = returns[t + 1]
                     target_next_return = target_returns[t + 1]
+                # ========== CHANGE ==========
+                # behavioral agent is trained with r + k * sigma,
+                # where sigma is the square root of predicted variance.
+                # which is the calculated predicted UCB.
+                # ============================
                 returns[t] = rewards[t] + variance_reward[t].sqrt() # + args.gamma * nextnonterminal * next_return
                 target_returns[t] = rewards[t] + args.gamma * nextnonterminal * target_next_return
             advantages = returns - values
@@ -275,6 +291,10 @@ if __name__ == "__main__":
         with torch.no_grad():
             _, b_target_logprobs, _, _ = target_policy.get_action_and_value(b_obs, b_actions.long())
         # Importance sampling weights
+        
+        # ========== CHANGE ==========
+        # Importance sampling calculated for target agent update.
+        # ============================
         importance_sampling_weights = torch.exp(b_target_logprobs - b_logprobs).reshape(-1).detach()
 
         b_target_value_error = target_advantages.reshape(-1).detach() ** 2
@@ -352,7 +372,10 @@ if __name__ == "__main__":
 
                 target_newvalue = target_newvalue.view(-1)
                 target_v_loss_unclipped = (target_newvalue - b_target_returns[mb_inds]) ** 2
-                # target_v_loss_unclipped *= importance_sampling_weights[mb_inds]
+                # ========== CHANGE ==========
+                # Importance sampling multiplied to target value loss
+                # ============================
+                target_v_loss_unclipped *= importance_sampling_weights[mb_inds]
                 target_v_clipped = b_values[mb_inds] + torch.clamp(
                     target_newvalue - b_values[mb_inds],
                     -args.clip_coef,
@@ -397,12 +420,15 @@ if __name__ == "__main__":
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
 
+        # ========== CHANGE ==========
+        # Test target policy
+        # ============================
         render_obs = render_env.reset()
         render_score = []
         current_render_score = 0
         while True:
             # Calculate Action with target policy
-            render_action, _, _, _ = behavior_policy.get_action_and_value(torch.Tensor(np.array(render_obs)).to(device).unsqueeze(0))
+            render_action, _, _, _ = target_policy.get_action_and_value(torch.Tensor(np.array(render_obs)).to(device).unsqueeze(0))
             next_render_obs, render_reward, done, _ = render_env.step(render_action.cpu().item())
             current_render_score += render_reward
             # render_env.render()
